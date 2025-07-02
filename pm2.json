@@ -2,9 +2,9 @@
     "apps": {
         "name": "coin_news",
         "describe": "币安消息监控",
-        "script": "python main.py",
+        "script": "main.py",
         "cwd": "./",
-        "interpreter": "",
+        "interpreter": "python",
         "args": ""
     }
   }
