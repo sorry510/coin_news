@@ -15,6 +15,7 @@ dingding_token = os.getenv("dingding_token")
 binance_accounts = [
     'binance_announcement',
     'binance_news',
+    'binancezh',
 ]
 
 async def binance_run(playwright: Playwright, accounts):
