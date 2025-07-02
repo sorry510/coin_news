@@ -77,8 +77,14 @@ def get_current_time():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 async def main():
-    async with async_playwright() as playwright:
-        await binance_run(playwright, binance_accounts)
+    print('Starting Binance news monitoring...')
+    while True:
+        print('Checking Binance news...')
+        async with async_playwright() as playwright:
+            await binance_run(playwright, binance_accounts)
+        print('Waiting for 60 seconds before the next check...')
+        # 每 60 秒检查一次
+        await asyncio.sleep(60)
         
 if __name__ == '__main__':      
     asyncio.run(main())
