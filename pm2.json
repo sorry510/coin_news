@@ -1,0 +1,10 @@
+{
+    "apps": {
+        "name": "coin_news",
+        "describe": "币安消息监控",
+        "script": "python main.py",
+        "cwd": "./",
+        "interpreter": "",
+        "args": ""
+    }
+  }
