@@ -27,15 +27,25 @@ async def binance_run(playwright: Playwright, accounts):
         print(f'Visiting URL: {url}')
         await page.goto(url)
         await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
-        first_article_url = await page.locator('.feed-layout-main .FeedList .feed-content-text a').nth(0).get_attribute('href') # 找到第一个，进入明细页面
+        first_article_url = None
+        index = 0
+        while not first_article_url:
+            cardText = await page.locator('.feed-layout-main .FeedList .feed-content-text').nth(index).text_content()  # 获取文章内容
+            if '置顶' not in cardText:
+                first_article_url = await page.locator('.feed-layout-main .FeedList .feed-content-text a').nth(index).get_attribute('href') # 找到第一个非置顶，进入明细页面
+            index += 1
         detail_url = f'https://www.binance.com/zh-CN{first_article_url}'
         print(f'First article URL: {detail_url}')
         await page.goto(detail_url)
         await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
         create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 获取文章内容
-        mins, ext = create_time.split(' ')  # 只保留日期部分
-        if int(mins) < 2 and ext.startswith('分钟'):
-            # 2 分钟前的新闻发送通知
+        timeArr = create_time.split(' ')  # 只保留日期部分
+        if len(timeArr) < 2:
+            continue
+        mins = timeArr[0]  # 获取分钟数
+        ext = timeArr[1]  # 获取时间单位（分钟、小时等）
+        if int(mins) < 4 and ext.startswith('分钟'):
+            # 3 分钟前的新闻发送通知
             print('准备发送钉钉通知')
             article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
             res = send_dingtalk_markdown('binance_news 报警通知: ' + account, article_text)
