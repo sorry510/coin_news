@@ -44,11 +44,11 @@ async def binance_run(playwright: Playwright, accounts):
             continue
         mins = timeArr[0]  # 获取分钟数
         ext = timeArr[1]  # 获取时间单位（分钟、小时等）
-        if int(mins) < 4 and ext.startswith('分钟'):
+        if int(mins) <= 5 and ext.startswith('分钟'):
             # 3 分钟前的新闻发送通知
             print('准备发送钉钉通知')
             article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
-            res = send_dingtalk_markdown('binance_news 报警通知: ' + account, article_text)
+            res = send_dingtalk_markdown('bn报警通知: ' + account, article_text)
             print(res)
     await browser.close()
     
