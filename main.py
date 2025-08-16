@@ -48,9 +48,21 @@ async def binance_run(playwright: Playwright, accounts):
             # 3 分钟前的新闻发送通知
             print('准备发送钉钉通知')
             article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
+            if not check_keywords(article_text):
+                continue
             res = send_dingtalk_markdown('bn报警通知: ' + account, article_text)
             print(res)
     await browser.close()
+    
+def check_keywords(article: str):
+    """
+    检查文章内容是否包含特定关键词
+    :param article: 文章内容
+    :return: bool, 是否包含关键词
+    """
+    keywords = ['活动', '奖励', 'Alpha', '上线']
+    return any(keyword in article for keyword in keywords)
+    
     
 def send_dingtalk_markdown(title, text, is_at_all=True):
     """
