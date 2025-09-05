@@ -60,7 +60,7 @@ def check_keywords(article: str):
     :param article: 文章内容
     :return: bool, 是否包含关键词
     """
-    keywords = ['活动', '奖励', 'Alpha', '上线']
+    keywords = ['活动', '奖励', 'Alpha', '上线', '空投', '赠送', '福利', '送出', '补贴', '交易大赛', '交易竞赛']
     return any(keyword in article for keyword in keywords)
     
     
