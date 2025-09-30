@@ -16,6 +16,7 @@ binance_accounts = [
     'binance_announcement',
     'binance_news',
     'binancezh',
+    'marktowin',
 ]
 
 async def binance_run(playwright: Playwright, accounts):
@@ -34,7 +35,7 @@ async def binance_run(playwright: Playwright, accounts):
             if '置顶' not in cardText:
                 first_article_url = await page.locator('.feed-layout-main .FeedList .feed-content-text a').nth(index).get_attribute('href') # 找到第一个非置顶，进入明细页面
             index += 1
-        detail_url = f'https://www.binance.com/zh-CN{first_article_url}'
+        detail_url = f'https://www.binance.com{first_article_url}'
         print(f'First article URL: {detail_url}')
         await page.goto(detail_url)
         await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
@@ -60,7 +61,7 @@ def check_keywords(article: str):
     :param article: 文章内容
     :return: bool, 是否包含关键词
     """
-    keywords = ['活动', '奖励', 'Alpha', '上线', '空投', '赠送', '福利', '送出', '补贴', '交易大赛', '交易竞赛', '抽取', '抽奖']
+    keywords = ['活动', '奖励', 'Alpha', '上线', '上市', 'alpha', '空投', '赠送', '福利', '送出', '补贴', '交易大赛', '交易竞赛', '抽取', '抽奖', '赠币', '奖励金', '奖励计划']
     return any(keyword in article for keyword in keywords)
     
     
