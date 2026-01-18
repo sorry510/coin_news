@@ -15,12 +15,22 @@ dingding_token = os.getenv("dingding_token")
 binance_accounts_str = os.getenv("binance_accounts", "")
 binance_accounts = binance_accounts_str.split(",") if binance_accounts_str else []
 effective_time = int(os.getenv("effective_time", "5"))
+semaphore_limit = int(os.getenv("semaphore_limit", "1"))
 
-async def binance_run(playwright: Playwright, accounts):
-    chromium = playwright.chromium # or "firefox" or "webkit".
-    browser = await chromium.launch(headless=True)  # Set headless=False to see the browser actions
-    page = await browser.new_page()
-    for account in accounts:
+sem = asyncio.Semaphore(semaphore_limit)  # 最多 n 个并发
+
+async def binance_run(accounts):
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        results = await asyncio.gather(
+            *(visit_account(context, account) for account in accounts)
+        )
+        await browser.close()
+    
+async def visit_account(context: Playwright, account: str):
+    async with sem:
+        page = await context.new_page()
         url = f'https://www.binance.com/zh-CN/square/profile/{account}'
         print(f'Visiting URL: {url}')
         await page.goto(url)
@@ -39,23 +49,22 @@ async def binance_run(playwright: Playwright, accounts):
         create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 获取文章内容
         timeArr = create_time.split(' ')  # 只保留日期部分
         if len(timeArr) < 2:
-            continue
+            return
         mins = timeArr[0]  # 获取分钟数
         ext = timeArr[1]  # 获取时间单位（分钟、小时等）
         if int(mins) <= effective_time and ext.startswith('分钟'):
             # 3 分钟前的新闻发送通知
-            print('准备发送钉钉通知')
             article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
             if not check_keywords(article_text):
-                continue
+                return
             if has_sends_url.get(detail_url):
                 print('该新闻已发送过通知，跳过')
-                continue        
+                return        
             has_sends_url[detail_url] = True
+            print('准备发送钉钉通知')
             res = send_dingtalk_markdown('bn报警通知: ' + account, article_text)
             print(res)
-    await browser.close()
-    
+            
 def check_keywords(article: str):
     """
     检查文章内容是否包含特定关键词
@@ -106,8 +115,7 @@ async def main():
         if has_sends_url.__len__() > 1000:
             has_sends_url.clear()  # 清理已发送记录，防止内存占用过高
         print('Checking Binance news...')
-        async with async_playwright() as playwright:
-            await binance_run(playwright, binance_accounts)
+        await binance_run(binance_accounts)
         print('Waiting for 60 seconds before the next check...')
         # 每 60 秒检查一次
         await asyncio.sleep(60)
