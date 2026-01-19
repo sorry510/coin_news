@@ -13,3 +13,17 @@ playwright install chromium
 ```commandline
 python main.py
 ```
+
+## uv
+
+### 安装
+```
+uv venv 
+uv pip install -r requirements.txt
+```
+
+### 运行
+
+```
+uv run main.py
+```
