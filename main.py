@@ -1,4 +1,5 @@
 import asyncio
+import re
 from playwright.async_api import async_playwright, Playwright
 import requests
 import json
@@ -18,6 +19,12 @@ effective_time = int(os.getenv("effective_time", "5"))
 semaphore_limit = int(os.getenv("semaphore_limit", "1"))
 
 sem = asyncio.Semaphore(semaphore_limit)  # 最多 n 个并发
+
+def parse_create_time(create_time: str):
+    match = re.match(r'^(\d+)\s*(分钟|小时|天｜月｜年)(?:前)?$', create_time.strip())
+    if not match:
+        return 0, '天'
+    return int(match.group(1)), match.group(2)
 
 async def binance_run(accounts):
     async with async_playwright() as playwright:
@@ -46,13 +53,10 @@ async def visit_account(context: Playwright, account: str):
         print(f'First article URL: {detail_url}')
         await page.goto(detail_url)
         await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
-        create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 获取文章内容
-        timeArr = create_time.split(' ')  # 只保留日期部分
-        if len(timeArr) < 2:
-            return
-        mins = timeArr[0]  # 获取分钟数
-        ext = timeArr[1]  # 获取时间单位（分钟、小时等）
-        if int(mins) <= effective_time and ext.startswith('分钟'):
+        create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 14分钟 或 14 分钟前
+        mins, ext = parse_create_time(create_time)
+            
+        if mins <= effective_time and ext == '分钟':
             # 3 分钟前的新闻发送通知
             article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
             if not check_keywords(article_text):
