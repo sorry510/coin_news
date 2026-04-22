@@ -53,7 +53,7 @@ async def visit_account(context: Playwright, account: str):
         print(f'First article URL: {detail_url}')
         await page.goto(detail_url)
         await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
-        await asyncio.sleep(3)  # 等待页面完全加载，确保能获取到发布时间等信息
+        await asyncio.sleep(5)  # 等待页面完全加载，确保能获取到发布时间等信息
         create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 14分钟 或 14 分钟前
         mins, ext = parse_create_time(create_time)
         print(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
