@@ -55,6 +55,7 @@ async def visit_account(context: Playwright, account: str):
         await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
         create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 14分钟 或 14 分钟前
         mins, ext = parse_create_time(create_time)
+        print(f'Article create time: {create_time}, parsed as {mins} {ext}')
             
         if mins <= effective_time and ext == '分钟':
             # 3 分钟前的新闻发送通知
