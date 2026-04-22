@@ -23,7 +23,7 @@ sem = asyncio.Semaphore(semaphore_limit)  # 最多 n 个并发
 def parse_create_time(create_time: str):
     match = re.match(r'^(\d+)\s*(分钟|小时|天｜月｜年)(?:前)?$', create_time.strip())
     if not match:
-        return 0, '天'
+        return 0, '未知'
     return int(match.group(1)), match.group(2)
 
 async def binance_run(accounts):
