@@ -56,12 +56,13 @@ async def visit_account(context: Playwright, account: str):
         await asyncio.sleep(3)  # 等待页面完全加载，确保能获取到发布时间等信息
         create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 14分钟 或 14 分钟前
         mins, ext = parse_create_time(create_time)
-        print(f'Article create time: {create_time}, parsed as {mins} {ext}')
+        print(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
             
         if mins <= effective_time and ext == '分钟':
             # 3 分钟前的新闻发送通知
             article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
             if not check_keywords(article_text):
+                print('文章内容不包含关键词，跳过')
                 return
             if has_sends_url.get(detail_url):
                 print('该新闻已发送过通知，跳过')
