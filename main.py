@@ -59,10 +59,10 @@ async def visit_account(context: Playwright, account: str):
         print(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
             
         if mins <= effective_time and ext == '分钟':
-            # 3 分钟前的新闻发送通知
+            # n 分钟前的新闻发送通知
             article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
             if not check_keywords(article_text):
-                print('文章内容不包含关键词，跳过')
+                print(f'文章内容不包含关键词，{article_text[:30]}...，跳过')
                 return
             if has_sends_url.get(detail_url):
                 print('该新闻已发送过通知，跳过')
@@ -71,6 +71,8 @@ async def visit_account(context: Playwright, account: str):
             print('准备发送钉钉通知')
             res = send_dingtalk_markdown('bn报警通知: ' + account, article_text)
             print(res)
+        else:
+            print('新闻发布时间超过有效时间，跳过')
             
 def check_keywords(article: str):
     """
