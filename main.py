@@ -17,6 +17,8 @@ binance_accounts_str = os.getenv("binance_accounts", "")
 binance_accounts = binance_accounts_str.split(",") if binance_accounts_str else []
 effective_time = int(os.getenv("effective_time", "5"))
 semaphore_limit = int(os.getenv("semaphore_limit", "1"))
+keywords_str = os.getenv("keywords", "")
+keywords = [k.strip() for k in keywords_str.split(",") if k.strip()]
 
 sem = asyncio.Semaphore(semaphore_limit)  # 最多 n 个并发
 
@@ -92,7 +94,6 @@ def check_keywords(article: str):
     :param article: 文章内容
     :return: bool, 是否包含关键词
     """
-    keywords = ['活动', '奖励', 'Alpha', '上线', '上市', 'alpha', '空投', '赠送', '福利', '送出', '补贴', '交易大赛', '交易竞赛', '抽取', '抽奖', '赠币', '奖励金', '奖励计划']
     return any(keyword in article for keyword in keywords)
     
 def send_dingtalk_markdown(title, text, is_at_all=True):
