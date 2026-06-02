@@ -44,13 +44,25 @@ async def visit_account(context: Playwright, account: str):
         await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
         first_article_url = None
         index = 0
-        while not first_article_url:
-            cardText = await page.locator('.feed-layout-main .FeedList .feed-card').nth(index).all_text_contents()
-            if '置顶' not in cardText:
-                first_article_url = await page.locator('.feed-layout-main .FeedList .feed-content-text a').nth(index).get_attribute('href') # 找到第一个非置顶，进入明细页面
+        while index < 5:  # 最多检查前5条，避免死循环
+            card_locator = page.locator('.feed-layout-main .FeedList .feed-card').nth(index)
+            try:
+                await card_locator.wait_for(state='visible', timeout=5000)
+                card_text = await card_locator.text_content() or ''
+            except Exception as e:
+                print(f'获取第 {index} 条卡片文本失败: {e}')
+                index += 1
+                continue
+            if card_text != '' and '置顶' not in card_text:
+                print(f'Found non-pinned article text: {card_text[:50]}..., trying to get URL')
+                first_article_url = await card_locator.locator('.feed-content-text a').nth(0).get_attribute('href')
+                break
             index += 1
+        if not first_article_url:
+            print('未找到文章，跳过')
+            return
         detail_url = f'https://www.binance.com{first_article_url}'
-        print(f'First article URL: {detail_url}')
+        print(f'First article URL: {detail_url}, Index: {index}')
         await page.goto(detail_url)
         await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
         await asyncio.sleep(5)  # 等待页面完全加载，确保能获取到发布时间等信息
