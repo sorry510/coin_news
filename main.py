@@ -94,13 +94,13 @@ async def visit_account(context: BrowserContext, account: str):
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
             await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
             # 币安已移除 .FeedList 包裹层，直接使用 .feed-card
-            # 先在个人主页收集前 5 篇非置顶文章的链接，再逐篇进入详情页检查时间与关键词：
+            # 先在个人主页收集前 2 篇非置顶文章的链接，再逐篇进入详情页检查时间与关键词：
             # 找到第一篇「最近 N 分钟内 + 含关键词」的即推送并结束；若某篇无时间戳(--)或超过
             # 有效时间则继续检查下一篇，避免被异常帖卡住导致漏检。
             # 注意：必须先收集完链接再导航，否则离开主页后卡片选择器将失效。
             candidate_urls = []
             idx = 0
-            while idx < 5 and len(candidate_urls) < 5:
+            while idx < 6 and len(candidate_urls) < 2:
                 card_locator = page.locator('.feed-layout-main .feed-card').nth(idx)
                 try:
                     await card_locator.wait_for(state='visible', timeout=5000)
