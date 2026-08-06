@@ -43,6 +43,25 @@ def parse_create_time(create_time: str):
         return 0, '未知'
     return int(match.group(1)), match.group(2)
 
+async def get_create_time(page):
+    """
+    读取详情页发布时间。该字段由 JS 异步渲染，冷加载时可能先返回占位符 '--'，
+    因此轮询重试：一旦拿到非 '--' 的有效相对时间（含 分钟/小时/天/月/年）即返回；
+    若始终为 '--'/空，则返回最后读到的值（交由上层当作「未知」跳过该帖，继续检查下一篇）。
+    """
+    locator = page.locator('.feed-layout-main .author .create-time')
+    last = ''
+    for _ in range(7):
+        try:
+            txt = (await locator.text_content() or '').strip()
+        except Exception:
+            txt = ''
+        if txt and txt != '--':
+            return txt
+        last = txt
+        await asyncio.sleep(1.5)
+    return last
+
 async def binance_run(accounts):
     async with async_playwright() as playwright:
         # 关闭 AutomationControlled 特征，降低被反爬识别的概率
@@ -105,8 +124,9 @@ async def visit_account(context: BrowserContext, account: str):
                 print(f'检查候选 {i}: {detail_url}')
                 await page.goto(detail_url, wait_until='domcontentloaded', timeout=30000)
                 await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
-                await asyncio.sleep(5)  # 等待页面完全加载，确保能获取到发布时间等信息
-                create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 14分钟 或 14 分钟前
+                # 发布时间由 JS 异步渲染，冷加载可能先返回 '--'，原地轮询等待真实值
+                await asyncio.sleep(2)
+                create_time = await get_create_time(page)  # 14分钟 或 14 分钟前
                 mins, ext = parse_create_time(create_time)
                 print(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
 
