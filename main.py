@@ -1,6 +1,8 @@
 import asyncio
 import re
-from playwright.async_api import async_playwright, Playwright
+import time
+import traceback
+from playwright.async_api import async_playwright, BrowserContext
 import requests
 import json
 from datetime import datetime
@@ -22,72 +24,117 @@ keywords = [k.strip() for k in keywords_str.split(",") if k.strip()]
 
 sem = asyncio.Semaphore(semaphore_limit)  # 最多 n 个并发
 
+# 自定义浏览器指纹，避免被币安 CloudFront WAF 识别为爬虫（默认 UA 会触发 403 拦截）
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# 错误通知节流：同一类运行异常最多每 10 分钟推送一次钉钉，避免刷屏
+ERROR_NOTIFY_INTERVAL = 10 * 60
+last_error_notify_time = 0.0
+
+
 def parse_create_time(create_time: str):
-    match = re.match(r'^(\d+)\s*(分钟|小时|天｜月｜年)(?:前)?$', create_time.strip())
+    if not create_time:
+        return 0, '未知'
+    match = re.match(r'^(\d+)\s*(分钟|小时|天|月|年)(?:前)?$', create_time.strip())
     if not match:
         return 0, '未知'
     return int(match.group(1)), match.group(2)
 
 async def binance_run(accounts):
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context()
-        results = await asyncio.gather(
-            *(visit_account(context, account) for account in accounts)
+        # 关闭 AutomationControlled 特征，降低被反爬识别的概率
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
         )
-        await browser.close()
-    
-async def visit_account(context: Playwright, account: str):
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            locale="zh-CN",
+            viewport={"width": 1280, "height": 900},
+        )
+        # 隐藏 webdriver 标志
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        try:
+            await asyncio.gather(
+                *(visit_account(context, account) for account in accounts)
+            )
+        finally:
+            await browser.close()
+
+async def visit_account(context: BrowserContext, account: str):
     async with sem:
         page = await context.new_page()
-        url = f'https://www.binance.com/zh-CN/square/profile/{account}'
-        print(f'Visiting URL: {url}')
-        await page.goto(url)
-        await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
-        first_article_url = None
-        index = 0
-        while index < 5:  # 最多检查前5条，避免死循环
-            card_locator = page.locator('.feed-layout-main .FeedList .feed-card').nth(index)
-            try:
-                await card_locator.wait_for(state='visible', timeout=5000)
-                card_text = await card_locator.text_content() or ''
-            except Exception as e:
-                print(f'获取第 {index} 条卡片文本失败: {e}')
-                index += 1
-                continue
-            if card_text != '' and '置顶' not in card_text:
-                print(f'Found non-pinned article text: {card_text[:50]}..., trying to get URL')
-                first_article_url = await card_locator.locator('.feed-content-text a').nth(0).get_attribute('href')
-                break
-            index += 1
-        if not first_article_url:
-            print('未找到文章，跳过')
-            return
-        detail_url = f'https://www.binance.com{first_article_url}'
-        print(f'First article URL: {detail_url}, Index: {index}')
-        await page.goto(detail_url)
-        await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
-        await asyncio.sleep(5)  # 等待页面完全加载，确保能获取到发布时间等信息
-        create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 14分钟 或 14 分钟前
-        mins, ext = parse_create_time(create_time)
-        print(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
-            
-        if mins <= effective_time and ext == '分钟':
-            # n 分钟前的新闻发送通知
-            article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
-            if not check_keywords(article_text):
-                print(f'文章内容不包含关键词，{article_text[:30]}...，跳过')
+        try:
+            url = f'https://www.binance.com/zh-CN/square/profile/{account}'
+            print(f'Visiting URL: {url}')
+            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
+            # 币安已移除 .FeedList 包裹层，直接使用 .feed-card
+            # 先在个人主页收集前 5 篇非置顶文章的链接，再逐篇进入详情页检查时间与关键词：
+            # 找到第一篇「最近 N 分钟内 + 含关键词」的即推送并结束；若某篇无时间戳(--)或超过
+            # 有效时间则继续检查下一篇，避免被异常帖卡住导致漏检。
+            # 注意：必须先收集完链接再导航，否则离开主页后卡片选择器将失效。
+            candidate_urls = []
+            idx = 0
+            while idx < 5 and len(candidate_urls) < 5:
+                card_locator = page.locator('.feed-layout-main .feed-card').nth(idx)
+                try:
+                    await card_locator.wait_for(state='visible', timeout=5000)
+                    card_text = await card_locator.text_content() or ''
+                except Exception as e:
+                    print(f'获取第 {idx} 条卡片文本失败: {e}')
+                    idx += 1
+                    continue
+                if card_text.strip() and '置顶' not in card_text:
+                    href = await card_locator.locator('.feed-content-text a').nth(0).get_attribute('href')
+                    if href:
+                        candidate_urls.append(href)
+                idx += 1
+
+            if not candidate_urls:
+                print('未找到候选文章，跳过')
                 return
-            if has_sends_url.get(detail_url):
-                print('该新闻已发送过通知，跳过')
-                return        
-            has_sends_url[detail_url] = True
-            print('准备发送钉钉通知')
-            res = send_dingtalk_markdown('bn报警通知: ' + account, article_text)
-            print(res)
-        else:
-            print('新闻发布时间超过有效时间，跳过')
-            
+
+            for i, rel in enumerate(candidate_urls):
+                detail_url = f'https://www.binance.com{rel}'
+                print(f'检查候选 {i}: {detail_url}')
+                await page.goto(detail_url, wait_until='domcontentloaded', timeout=30000)
+                await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
+                await asyncio.sleep(5)  # 等待页面完全加载，确保能获取到发布时间等信息
+                create_time = await page.locator('.feed-layout-main .author .create-time').text_content()  # 14分钟 或 14 分钟前
+                mins, ext = parse_create_time(create_time)
+                print(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
+
+                if mins <= effective_time and ext == '分钟':
+                    article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
+                    if not check_keywords(article_text):
+                        print('文章内容不包含关键词，继续检查下一条')
+                        continue
+                    if has_sends_url.get(detail_url):
+                        print('该新闻已发送过通知，继续检查下一条')
+                        continue
+                    has_sends_url[detail_url] = True
+                    print('准备发送钉钉通知')
+                    res = send_dingtalk_markdown('bn报警通知: ' + account, article_text)
+                    print(res)
+                    break  # 本周期只推送一条，结束该账号检查
+                else:
+                    print('新闻发布时间超过有效时间或无时间戳，继续检查下一条')
+                    continue
+            else:
+                print('候选文章均未命中条件，跳过')
+        except Exception as e:
+            # 单个账号出错不应中断整个监控循环，捕获后统一告警
+            print(f'处理账号 {account} 时出错: {e}')
+            notify_error(e)
+        finally:
+            await page.close()
+
 def check_keywords(article: str):
     """
     检查文章内容是否包含特定关键词
@@ -95,16 +142,29 @@ def check_keywords(article: str):
     :return: bool, 是否包含关键词
     """
     return any(keyword in article for keyword in keywords)
-    
+
+def _post_dingtalk(payload):
+    """发送钉钉消息，返回响应；发送失败仅打印不影响主流程"""
+    headers = {'Content-Type': 'application/json'}
+    if not dingding_token:
+        print('未配置 dingding_token，跳过钉钉推送')
+        return None
+    webhook_url = f'https://oapi.dingtalk.com/robot/send?access_token={dingding_token}'
+    try:
+        response = requests.post(webhook_url, headers=headers, data=json.dumps(payload), timeout=10)
+        return response.json()
+    except Exception as e:
+        print('钉钉推送请求失败:', e)
+        return None
+
 def send_dingtalk_markdown(title, text, is_at_all=True):
     """
     发送钉钉 Markdown 格式消息
-    
+
     :param title: 消息标题（显示在通知卡片上）
     :param text: Markdown 格式的消息内容
     :param is_at_all: 是否@所有人
     """
-    headers = {'Content-Type': 'application/json'}
     payload = {
         "msgtype": "markdown",
         "markdown": {
@@ -116,9 +176,37 @@ def send_dingtalk_markdown(title, text, is_at_all=True):
             "isAtAll": is_at_all
         }
     }
-    webhook_url = f'https://oapi.dingtalk.com/robot/send?access_token={dingding_token}'
-    response = requests.post(webhook_url, headers=headers, data=json.dumps(payload))
-    return response.json()
+    return _post_dingtalk(payload)
+
+def notify_error(exc: Exception):
+    """
+    捕获程序运行异常并推送钉钉告警。
+    通过全局节流控制：相同/连续的运行异常最多每 10 分钟推送一次，避免刷屏。
+    """
+    global last_error_notify_time
+    now = time.time()
+    if now - last_error_notify_time < ERROR_NOTIFY_INTERVAL:
+        print('错误告警处于 10 分钟冷却期，本次跳过')
+        return
+    last_error_notify_time = now
+
+    tb = traceback.format_exc()
+    detail = tb if tb and tb.strip() and 'NoneType: None' not in tb else str(exc)
+    title = "币安监控程序运行异常"
+    markdown_text = (
+        f"## {title}\n"
+        f"> 时间：{get_current_time()}\n\n"
+        f"程序运行中出现异常，最近一次报错信息如下：\n\n"
+        f"```\n{detail[-1800:]}\n```"
+    )
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {"title": title, "text": markdown_text},
+        "at": {"atMobiles": [], "isAtAll": False},
+    }
+    print('推送错误告警到钉钉...')
+    res = _post_dingtalk(payload)
+    print('错误告警发送结果:', res)
 
 def mark_down_template(title, text):
     return f"""
@@ -134,13 +222,18 @@ def get_current_time():
 async def main():
     print('Starting Binance news monitoring...')
     while True:
-        if has_sends_url.__len__() > 1000:
-            has_sends_url.clear()  # 清理已发送记录，防止内存占用过高
-        print('Checking Binance news...')
-        await binance_run(binance_accounts)
+        try:
+            if len(has_sends_url) > 1000:
+                has_sends_url.clear()  # 清理已发送记录，防止内存占用过高
+            print('Checking Binance news...')
+            await binance_run(binance_accounts)
+        except Exception as e:
+            # 顶层兜底：浏览器启动/网络等致命错误也会触发告警
+            print(f'检测循环发生异常: {e}')
+            notify_error(e)
         print('Waiting for 60 seconds before the next check...')
         # 每 60 秒检查一次
         await asyncio.sleep(60)
-        
-if __name__ == '__main__':      
+
+if __name__ == '__main__':
     asyncio.run(main())
