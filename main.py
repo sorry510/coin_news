@@ -140,7 +140,7 @@ async def visit_account(context: BrowserContext, account: str):
                         continue
                     has_sends_url[detail_url] = True
                     print('准备发送钉钉通知')
-                    res = send_dingtalk_markdown('bn报警通知: ' + account, article_text)
+                    res = send_dingtalk_markdown('binance广场消息报警: ' + account, article_text)
                     print(res)
                     break  # 本周期只推送一条，结束该账号检查
                 else:
@@ -212,7 +212,7 @@ def notify_error(exc: Exception):
 
     tb = traceback.format_exc()
     detail = tb if tb and tb.strip() and 'NoneType: None' not in tb else str(exc)
-    title = "币安监控程序运行异常"
+    title = "binance广场消息监控程序异常报警"
     markdown_text = (
         f"## {title}\n"
         f"> 时间：{get_current_time()}\n\n"
