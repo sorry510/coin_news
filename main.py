@@ -45,6 +45,11 @@ FEED_ROOT_SELECTOR = '.feed-layout-main'
 PAGE_LOAD_TIMEOUT = 30_000
 FEED_VISIBLE_TIMEOUT = 20_000
 PAGE_LOAD_ATTEMPTS = 3
+ARTICLE_TEXT_TIMEOUT = 10_000
+ARTICLE_TEXT_SELECTORS = (
+    '.feed-layout-main .richtext-container',
+    '.feed-layout-main .article-body',
+)
 
 
 def parse_create_time(create_time: str):
@@ -119,6 +124,45 @@ async def goto_feed_page(page: Page, url: str):
         f'{diagnostics}'
     )
 
+
+async def get_article_text(page: Page, preview_text: str = ''):
+    """读取详情页正文；详情模板不同时使用页面元数据或主页摘要回退。"""
+    selector = ', '.join(ARTICLE_TEXT_SELECTORS)
+    try:
+        # 当前文章模板中 .article-body 包含 .richtext-container，取最后一个可避免
+        # 把标题、免责声明等外层内容混入正文；若内层 class 改版则仍可命中外层。
+        locator = page.locator(selector).last
+        await locator.wait_for(state='visible', timeout=ARTICLE_TEXT_TIMEOUT)
+        article_text = (await locator.inner_text(timeout=2_000) or '').strip()
+        if article_text:
+            return article_text
+    except PlaywrightError as exc:
+        print(f'详情页正文容器未出现，尝试摘要回退: {exc}')
+
+    fallback_candidates = [preview_text.strip()]
+    for meta_selector in ('meta[name="description"]', 'meta[property="og:description"]'):
+        try:
+            content = await page.locator(meta_selector).get_attribute(
+                'content',
+                timeout=2_000,
+            )
+            if content and content.strip():
+                fallback_candidates.append(content.strip())
+        except PlaywrightError:
+            continue
+
+    article_text = max(fallback_candidates, key=len, default='')
+    if article_text:
+        print('详情页正文容器不可用，使用主页/页面摘要继续检查关键词')
+        return article_text
+
+    try:
+        title = (await page.title()).strip() or '无标题'
+    except Exception:
+        title = '读取失败'
+    print(f'详情页没有可用正文或摘要，跳过本帖: URL={page.url}, 标题={title!r}')
+    return ''
+
 async def binance_run(accounts):
     async with async_playwright() as playwright:
         # 关闭 AutomationControlled 特征，降低被反爬识别的概率
@@ -154,9 +198,9 @@ async def visit_account(context: BrowserContext, account: str):
             # 找到第一篇「最近 N 分钟内 + 含关键词」的即推送并结束；若某篇无时间戳(--)或超过
             # 有效时间则继续检查下一篇，避免被异常帖卡住导致漏检。
             # 注意：必须先收集完链接再导航，否则离开主页后卡片选择器将失效。
-            candidate_urls = []
+            candidate_articles = []
             idx = 0
-            while idx < 6 and len(candidate_urls) < 2:
+            while idx < 6 and len(candidate_articles) < 2:
                 card_locator = page.locator('.feed-layout-main .feed-card').nth(idx)
                 try:
                     await card_locator.wait_for(state='visible', timeout=5000)
@@ -166,16 +210,21 @@ async def visit_account(context: BrowserContext, account: str):
                     idx += 1
                     continue
                 if card_text.strip() and '置顶' not in card_text:
-                    href = await card_locator.locator('.feed-content-text a').nth(0).get_attribute('href')
+                    content_locator = card_locator.locator('.feed-content-text').nth(0)
+                    href = await content_locator.locator('a').nth(0).get_attribute('href')
                     if href:
-                        candidate_urls.append(href)
+                        try:
+                            preview_text = (await content_locator.inner_text() or '').strip()
+                        except PlaywrightError:
+                            preview_text = card_text.strip()
+                        candidate_articles.append((href, preview_text))
                 idx += 1
 
-            if not candidate_urls:
+            if not candidate_articles:
                 print('未找到候选文章，跳过')
                 return
 
-            for i, rel in enumerate(candidate_urls):
+            for i, (rel, preview_text) in enumerate(candidate_articles):
                 detail_url = f'https://www.binance.com{rel}'
                 print(f'检查候选 {i}: {detail_url}')
                 await goto_feed_page(page, detail_url)
@@ -186,7 +235,10 @@ async def visit_account(context: BrowserContext, account: str):
                 print(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
 
                 if mins <= effective_time and ext == '分钟':
-                    article_text = await page.locator('.feed-layout-main .richtext-container').text_content()
+                    article_text = await get_article_text(page, preview_text)
+                    if not article_text:
+                        print('未能获取文章正文，继续检查下一条')
+                        continue
                     if not check_keywords(article_text):
                         print('文章内容不包含关键词，继续检查下一条')
                         continue
