@@ -2,7 +2,12 @@ import asyncio
 import re
 import time
 import traceback
-from playwright.async_api import async_playwright, BrowserContext
+from playwright.async_api import (
+    async_playwright,
+    BrowserContext,
+    Error as PlaywrightError,
+    Page,
+)
 import requests
 import json
 from datetime import datetime
@@ -17,7 +22,7 @@ has_sends_url = {} # 记录已发送通知的新闻链接,避免重复发送，�
 dingding_token = os.getenv("dingding_token")
 binance_accounts_str = os.getenv("binance_accounts", "")
 binance_accounts = binance_accounts_str.split(",") if binance_accounts_str else []
-effective_time = int(os.getenv("effective_time", "5"))
+effective_time = int(os.getenv("effective_time", "10"))
 semaphore_limit = int(os.getenv("semaphore_limit", "1"))
 keywords_str = os.getenv("keywords", "")
 keywords = [k.strip() for k in keywords_str.split(",") if k.strip()]
@@ -33,6 +38,13 @@ USER_AGENT = (
 # 错误通知节流：同一类运行异常最多每 10 分钟推送一次钉钉，避免刷屏
 ERROR_NOTIFY_INTERVAL = 10 * 60
 last_error_notify_time = 0.0
+
+# Binance Square 偶尔会返回风控页或出现前端资源加载超时。导航失败时有限重试，
+# 并在最终异常中保留 HTTP 状态、最终 URL、标题和页面文本，方便区分网络/风控/DOM 改版。
+FEED_ROOT_SELECTOR = '.feed-layout-main'
+PAGE_LOAD_TIMEOUT = 30_000
+FEED_VISIBLE_TIMEOUT = 20_000
+PAGE_LOAD_ATTEMPTS = 3
 
 
 def parse_create_time(create_time: str):
@@ -61,6 +73,51 @@ async def get_create_time(page):
         last = txt
         await asyncio.sleep(1.5)
     return last
+
+
+async def goto_feed_page(page: Page, url: str):
+    """打开 Binance Square 页面，等待正文区域出现；瞬时失败时重试。"""
+    diagnostics = ''
+    for attempt in range(1, PAGE_LOAD_ATTEMPTS + 1):
+        response = None
+        try:
+            response = await page.goto(
+                url,
+                wait_until='domcontentloaded',
+                timeout=PAGE_LOAD_TIMEOUT,
+            )
+            await page.wait_for_selector(
+                FEED_ROOT_SELECTOR,
+                state='visible',
+                timeout=FEED_VISIBLE_TIMEOUT,
+            )
+            return
+        except PlaywrightError as exc:
+            status = response.status if response else '无响应'
+            try:
+                title = (await page.title()).strip() or '无标题'
+            except Exception:
+                title = '读取失败'
+            try:
+                body_text = await page.locator('body').inner_text(timeout=2_000)
+                body_excerpt = re.sub(r'\s+', ' ', body_text).strip()[:300] or '空页面'
+            except Exception:
+                body_excerpt = '读取失败'
+            diagnostics = (
+                f'HTTP={status}, 最终URL={page.url}, 标题={title!r}, '
+                f'页面摘要={body_excerpt!r}, 原因={exc}'
+            )
+            print(
+                f'页面加载失败（第 {attempt}/{PAGE_LOAD_ATTEMPTS} 次）: '
+                f'{diagnostics}'
+            )
+            if attempt < PAGE_LOAD_ATTEMPTS:
+                await asyncio.sleep(attempt * 2)
+
+    raise RuntimeError(
+        f'连续 {PAGE_LOAD_ATTEMPTS} 次无法加载 Binance Square 正文: '
+        f'{diagnostics}'
+    )
 
 async def binance_run(accounts):
     async with async_playwright() as playwright:
@@ -91,8 +148,7 @@ async def visit_account(context: BrowserContext, account: str):
         try:
             url = f'https://www.binance.com/zh-CN/square/profile/{account}'
             print(f'Visiting URL: {url}')
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-            await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
+            await goto_feed_page(page, url)
             # 币安已移除 .FeedList 包裹层，直接使用 .feed-card
             # 先在个人主页收集前 2 篇非置顶文章的链接，再逐篇进入详情页检查时间与关键词：
             # 找到第一篇「最近 N 分钟内 + 含关键词」的即推送并结束；若某篇无时间戳(--)或超过
@@ -122,8 +178,7 @@ async def visit_account(context: BrowserContext, account: str):
             for i, rel in enumerate(candidate_urls):
                 detail_url = f'https://www.binance.com{rel}'
                 print(f'检查候选 {i}: {detail_url}')
-                await page.goto(detail_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_selector('.feed-layout-main', state='visible', timeout=20000)
+                await goto_feed_page(page, detail_url)
                 # 发布时间由 JS 异步渲染，冷加载可能先返回 '--'，原地轮询等待真实值
                 await asyncio.sleep(2)
                 create_time = await get_create_time(page)  # 14分钟 或 14 分钟前
