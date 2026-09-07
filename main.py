@@ -4,6 +4,7 @@ import time
 import traceback
 import logging
 import sys
+import argparse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from playwright.async_api import (
@@ -17,6 +18,7 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+from manual_verification import verification_portal
 
 class TimestampFormatter(logging.Formatter):
     """每一行（包括 Playwright 多行异常）都附带同一条日志的时间。"""
@@ -78,6 +80,44 @@ class FeedPageLoadError(RuntimeError):
 
 class WafChallengeError(FeedPageLoadError):
     """会话访问受限，交给整轮监控处理，不能回退成单篇跳过。"""
+
+
+class HumanVerificationRequired(WafChallengeError):
+    def __init__(self, page):
+        self.page = page
+        super().__init__(
+            f'HTTP=405, WAF=captcha：网站要求人工验证，自动重试已停止。URL={page.url}'
+        )
+
+
+async def wait_for_feed_or_captcha(page, captcha_detected, timeout):
+    """验证升级为 CAPTCHA 时立即结束正文等待，保留页面供人工操作。"""
+    if captcha_detected.is_set():
+        raise HumanVerificationRequired(page)
+    feed_task = asyncio.create_task(page.wait_for_selector(
+        FEED_ROOT_SELECTOR, state='visible', timeout=timeout,
+    ))
+    captcha_task = asyncio.create_task(captcha_detected.wait())
+    try:
+        await asyncio.wait((feed_task, captcha_task), return_when=asyncio.FIRST_COMPLETED)
+        if captcha_detected.is_set():
+            raise HumanVerificationRequired(page)
+        await feed_task
+    finally:
+        for task in (feed_task, captcha_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(feed_task, captcha_task, return_exceptions=True)
+
+
+async def wait_for_human_verification(page):
+    logger.error(
+        '监控暂停，保留人工验证页面，不再自动刷新。'
+        '请通过 SSH 转发服务器 127.0.0.1:8765，在下方临时入口完成人工验证。'
+    )
+    async with verification_portal(page, logger):
+        await page.wait_for_selector(FEED_ROOT_SELECTOR, state='visible', timeout=0)
+    logger.info('人工验证页面已恢复正文，继续使用当前会话监控')
 
 
 class NavigationGate:
@@ -146,11 +186,14 @@ async def goto_feed_page(page: Page, url: str, gate=None):
     restricted = False
     for attempt in range(1, PAGE_LOAD_ATTEMPTS + 1):
         response = None
+        captcha_detected = asyncio.Event()
 
         def on_response(current):
             nonlocal response
             if current.request.is_navigation_request() and current.request.frame == page.main_frame:
                 response = current
+                if current.headers.get('x-amzn-waf-action') == 'captcha':
+                    captcha_detected.set()
 
         page.on('response', on_response)
         try:
@@ -158,20 +201,22 @@ async def goto_feed_page(page: Page, url: str, gate=None):
             if response is None:
                 response = initial
             action = initial.headers.get('x-amzn-waf-action', '') if initial else ''
-            if action in ('challenge', 'captcha'):
+            if action == 'captcha' or captcha_detected.is_set():
+                raise HumanVerificationRequired(page)
+            if action == 'challenge':
                 logger.info('网站要求浏览器验证，保持页面等待自动完成: URL=%s, WAF=%s', url, action)
             elif initial and initial.status >= 400:
                 raise PlaywrightError(f'服务器返回 HTTP {initial.status}')
-            await page.wait_for_selector(
-                FEED_ROOT_SELECTOR,
-                state='visible',
-                timeout=CHALLENGE_TIMEOUT if action else FEED_VISIBLE_TIMEOUT,
+            await wait_for_feed_or_captcha(
+                page, captcha_detected, CHALLENGE_TIMEOUT if action else FEED_VISIBLE_TIMEOUT,
             )
             if action:
                 logger.info('浏览器验证完成，正文已加载: HTTP=%s, URL=%s',
                             response.status if response else '未知', page.url)
             return
         except PlaywrightError as exc:
+            if captcha_detected.is_set():
+                raise HumanVerificationRequired(page) from exc
             status = response.status if response else '无响应'
             waf_action = response.headers.get('x-amzn-waf-action', '') if response else ''
             if response is not None:
@@ -238,13 +283,13 @@ async def get_article_text(page: Page, preview_text: str = ''):
     return ''
 
 @asynccontextmanager
-async def browser_session():
+async def browser_session(headless=True):
     async with async_playwright() as playwright:
         # 使用原生 Chromium 配置，保留独立用户目录中的站点存储和缓存。
         context = await playwright.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_DATA_DIR),
             channel='chromium',
-            headless=True,
+            headless=headless,
             locale='zh-CN',
             viewport={'width': 1280, 'height': 900},
         )
@@ -273,6 +318,7 @@ async def binance_run(accounts, context=None):
 async def visit_account(context: BrowserContext, account: str, gate=None):
     async with sem:
         page = await context.new_page()
+        preserve_page = False
         try:
             url = f'https://www.binance.com/zh-CN/square/profile/{account}'
             logger.info(f'Visiting URL: {url}')
@@ -350,6 +396,9 @@ async def visit_account(context: BrowserContext, account: str, gate=None):
                     logger.info(f'本轮有 {failed_articles} 篇加载失败，其余候选未命中条件，下轮重试')
                 else:
                     logger.info('候选文章均未命中条件，跳过')
+        except HumanVerificationRequired as exc:
+            preserve_page = exc.page is page
+            raise
         except WafChallengeError:
             raise
         except Exception as e:
@@ -357,7 +406,8 @@ async def visit_account(context: BrowserContext, account: str, gate=None):
             logger.error(f'处理账号 {account} 时出错: {e}')
             notify_error(e)
         finally:
-            await page.close()
+            if not preserve_page:
+                await page.close()
 
 def check_keywords(article: str):
     """
@@ -450,6 +500,14 @@ async def monitor_loop(context, accounts):
                 has_sends_url.clear()
             logger.info('开始检查 Binance 新闻')
             await binance_run(accounts, context)
+        except HumanVerificationRequired as exc:
+            logger.error('%s', exc)
+            notify_error(exc)
+            try:
+                await wait_for_human_verification(exc.page)
+            finally:
+                await exc.page.close()
+            continue
         except WafChallengeError as exc:
             logger.error('浏览器验证未完成，整轮监控暂停；保留会话，60 秒后重新检查: %s', exc)
             notify_error(exc)
@@ -462,11 +520,11 @@ async def monitor_loop(context, accounts):
         await asyncio.sleep(60)
 
 
-async def main():
+async def main(headless=True):
     logger.info('启动 Binance 新闻监控')
     while True:
         try:
-            async with browser_session() as context:
+            async with browser_session(headless=headless) as context:
                 await monitor_loop(context, binance_accounts)
         except Exception as exc:
             logger.error('浏览器会话异常，60 秒后重建: %s', exc)
@@ -475,4 +533,7 @@ async def main():
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description='Binance Square 新闻监控')
+    parser.add_argument('--headed', action='store_true', help='显示浏览器窗口，允许在服务器桌面完成人工验证')
+    args = parser.parse_args()
+    asyncio.run(main(headless=not args.headed))

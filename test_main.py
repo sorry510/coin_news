@@ -24,6 +24,34 @@ def mock_page(responses):
 
 
 class NavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_captcha_never_retries_or_waits_for_feed(self):
+        page = mock_page([response(405, 'captcha')])
+        with patch.object(main.asyncio, 'sleep', new_callable=AsyncMock) as sleep:
+            with self.assertRaises(main.HumanVerificationRequired):
+                await main.goto_feed_page(page, page.url)
+        page.goto.assert_awaited_once()
+        page.wait_for_selector.assert_not_awaited()
+        sleep.assert_not_awaited()
+
+    async def test_challenge_upgrading_to_captcha_interrupts_feed_wait(self):
+        page = mock_page([response(202, 'challenge')])
+        stopped = asyncio.Event()
+
+        async def upgrade(*args, **kwargs):
+            final = response(405, 'captcha')
+            final.request = SimpleNamespace(is_navigation_request=lambda: True, frame=page.main_frame)
+            page.on.call_args.args[1](final)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        page.wait_for_selector.side_effect = upgrade
+        with self.assertRaises(main.HumanVerificationRequired):
+            await asyncio.wait_for(main.goto_feed_page(page, page.url), timeout=1)
+        page.goto.assert_awaited_once()
+        self.assertTrue(stopped.is_set())
+
     async def test_challenge_finishes_in_place_without_a_second_goto(self):
         page = mock_page([response(202, 'challenge')])
 
@@ -89,6 +117,33 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_captcha_pauses_until_human_completion_then_resumes(self):
+        page = MagicMock()
+        page.close = AsyncMock()
+        context = MagicMock()
+        entered = asyncio.Event()
+        completed = asyncio.Event()
+
+        async def human(_page):
+            entered.set()
+            await completed.wait()
+
+        with (
+            patch.object(main, 'binance_run', new_callable=AsyncMock,
+                         side_effect=[main.HumanVerificationRequired(page), asyncio.CancelledError]) as run,
+            patch.object(main, 'wait_for_human_verification', side_effect=human),
+            patch.object(main, 'notify_error'),
+        ):
+            task = asyncio.create_task(main.monitor_loop(context, ['account']))
+            await entered.wait()
+            self.assertEqual(run.await_count, 1)
+            page.close.assert_not_awaited()
+            completed.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(run.await_count, 2)
+        page.close.assert_awaited_once()
+
     async def test_gate_blocks_other_navigation_after_waf_failure(self):
         gate = main.NavigationGate()
         with self.assertRaises(main.WafChallengeError):
@@ -133,7 +188,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         entries = []
 
         @asynccontextmanager
-        async def session():
+        async def session(**options):
             entries.append(context)
             yield context
 
@@ -150,6 +205,19 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AccountTests(unittest.IsolatedAsyncioTestCase):
+    async def test_captcha_page_is_preserved(self):
+        page = MagicMock()
+        page.close = AsyncMock()
+        context = SimpleNamespace(new_page=AsyncMock(return_value=page))
+        with (
+            patch.object(main, 'sem', asyncio.Semaphore(1)),
+            patch.object(main, 'goto_feed_page', new_callable=AsyncMock,
+                         side_effect=main.HumanVerificationRequired(page)),
+        ):
+            with self.assertRaises(main.HumanVerificationRequired):
+                await main.visit_account(context, 'account')
+        page.close.assert_not_awaited()
+
     async def test_waf_failure_never_uses_preview_or_skips_to_next_post(self):
         card = MagicMock()
         card.wait_for = AsyncMock()
