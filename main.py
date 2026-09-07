@@ -2,6 +2,10 @@ import asyncio
 import re
 import time
 import traceback
+import logging
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
 from playwright.async_api import (
     async_playwright,
     BrowserContext,
@@ -13,6 +17,24 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+
+class TimestampFormatter(logging.Formatter):
+    """每一行（包括 Playwright 多行异常）都附带同一条日志的时间。"""
+
+    def format(self, record):
+        message = super().format(record)
+        prefix = f'[{self.formatTime(record, self.datefmt)}] [{record.levelname}] '
+        return '\n'.join(prefix + line for line in (message.splitlines() or ['']))
+
+
+logger = logging.getLogger('coin_news')
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(TimestampFormatter('%(message)s', datefmt='%Y-%m-%d %H:%M:%S %z'))
+    logger.addHandler(handler)
+
 
 # 加载 .env 文件
 load_dotenv()  # 默认加载项目根目录的 .env 文件
@@ -29,11 +51,9 @@ keywords = [k.strip() for k in keywords_str.split(",") if k.strip()]
 
 sem = asyncio.Semaphore(semaphore_limit)  # 最多 n 个并发
 
-# 自定义浏览器指纹，避免被币安 CloudFront WAF 识别为爬虫（默认 UA 会触发 403 拦截）
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+BROWSER_DATA_DIR = Path(__file__).resolve().parent / '.browser-data'
+NAVIGATION_INTERVAL = 3.0
+CHALLENGE_TIMEOUT = 45_000
 
 # 错误通知节流：同一类运行异常最多每 10 分钟推送一次钉钉，避免刷屏
 ERROR_NOTIFY_INTERVAL = 10 * 60
@@ -50,6 +70,42 @@ ARTICLE_TEXT_SELECTORS = (
     '.feed-layout-main .richtext-container',
     '.feed-layout-main .article-body',
 )
+
+
+class FeedPageLoadError(RuntimeError):
+    """页面经有限重试仍不可用，调用方可隔离单篇故障。"""
+
+
+class WafChallengeError(FeedPageLoadError):
+    """会话访问受限，交给整轮监控处理，不能回退成单篇跳过。"""
+
+
+class NavigationGate:
+    """同一会话串行导航，验证期间不让其他账号继续发起请求。"""
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.last_started = None
+        self.blocked_error = None
+
+    async def __aenter__(self):
+        await self.lock.acquire()
+        try:
+            if self.blocked_error:
+                raise self.blocked_error
+            if self.last_started is not None:
+                delay = NAVIGATION_INTERVAL - (time.monotonic() - self.last_started)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            self.last_started = time.monotonic()
+        except BaseException:
+            self.lock.release()
+            raise
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if isinstance(exc, WafChallengeError):
+            self.blocked_error = exc
+        self.lock.release()
 
 
 def parse_create_time(create_time: str):
@@ -70,7 +126,7 @@ async def get_create_time(page):
     last = ''
     for _ in range(7):
         try:
-            txt = (await locator.text_content() or '').strip()
+            txt = (await locator.text_content(timeout=1_000) or '').strip()
         except Exception:
             txt = ''
         if txt and txt != '--':
@@ -80,25 +136,46 @@ async def get_create_time(page):
     return last
 
 
-async def goto_feed_page(page: Page, url: str):
-    """打开 Binance Square 页面，等待正文区域出现；瞬时失败时重试。"""
+async def goto_feed_page(page: Page, url: str, gate=None):
+    """保留当前页面，让网站验证脚本完成后自动重新请求正文。"""
+    if gate is not None:
+        async with gate:
+            return await goto_feed_page(page, url)
+
     diagnostics = ''
+    restricted = False
     for attempt in range(1, PAGE_LOAD_ATTEMPTS + 1):
         response = None
+
+        def on_response(current):
+            nonlocal response
+            if current.request.is_navigation_request() and current.request.frame == page.main_frame:
+                response = current
+
+        page.on('response', on_response)
         try:
-            response = await page.goto(
-                url,
-                wait_until='domcontentloaded',
-                timeout=PAGE_LOAD_TIMEOUT,
-            )
+            initial = await page.goto(url, wait_until='domcontentloaded', timeout=PAGE_LOAD_TIMEOUT)
+            if response is None:
+                response = initial
+            action = initial.headers.get('x-amzn-waf-action', '') if initial else ''
+            if action in ('challenge', 'captcha'):
+                logger.info('网站要求浏览器验证，保持页面等待自动完成: URL=%s, WAF=%s', url, action)
+            elif initial and initial.status >= 400:
+                raise PlaywrightError(f'服务器返回 HTTP {initial.status}')
             await page.wait_for_selector(
                 FEED_ROOT_SELECTOR,
                 state='visible',
-                timeout=FEED_VISIBLE_TIMEOUT,
+                timeout=CHALLENGE_TIMEOUT if action else FEED_VISIBLE_TIMEOUT,
             )
+            if action:
+                logger.info('浏览器验证完成，正文已加载: HTTP=%s, URL=%s',
+                            response.status if response else '未知', page.url)
             return
         except PlaywrightError as exc:
             status = response.status if response else '无响应'
+            waf_action = response.headers.get('x-amzn-waf-action', '') if response else ''
+            if response is not None:
+                restricted = bool(waf_action) or status in (403, 429)
             try:
                 title = (await page.title()).strip() or '无标题'
             except Exception:
@@ -109,20 +186,17 @@ async def goto_feed_page(page: Page, url: str):
             except Exception:
                 body_excerpt = '读取失败'
             diagnostics = (
-                f'HTTP={status}, 最终URL={page.url}, 标题={title!r}, '
+                f'HTTP={status}, WAF={waf_action or "无"}, 最终URL={page.url}, 标题={title!r}, '
                 f'页面摘要={body_excerpt!r}, 原因={exc}'
             )
-            print(
-                f'页面加载失败（第 {attempt}/{PAGE_LOAD_ATTEMPTS} 次）: '
-                f'{diagnostics}'
-            )
-            if attempt < PAGE_LOAD_ATTEMPTS:
-                await asyncio.sleep(attempt * 2)
+            logger.warning('页面加载失败（第 %s/%s 次）: %s', attempt, PAGE_LOAD_ATTEMPTS, diagnostics)
+        finally:
+            page.remove_listener('response', on_response)
+        if attempt < PAGE_LOAD_ATTEMPTS:
+            await asyncio.sleep(attempt * (10 if restricted else 2))
 
-    raise RuntimeError(
-        f'连续 {PAGE_LOAD_ATTEMPTS} 次无法加载 Binance Square 正文: '
-        f'{diagnostics}'
-    )
+    error_type = WafChallengeError if restricted else FeedPageLoadError
+    raise error_type(f'连续 {PAGE_LOAD_ATTEMPTS} 次无法加载 Binance Square 正文: {diagnostics}')
 
 
 async def get_article_text(page: Page, preview_text: str = ''):
@@ -137,7 +211,7 @@ async def get_article_text(page: Page, preview_text: str = ''):
         if article_text:
             return article_text
     except PlaywrightError as exc:
-        print(f'详情页正文容器未出现，尝试摘要回退: {exc}')
+        logger.info(f'详情页正文容器未出现，尝试摘要回退: {exc}')
 
     fallback_candidates = [preview_text.strip()]
     for meta_selector in ('meta[name="description"]', 'meta[property="og:description"]'):
@@ -153,46 +227,56 @@ async def get_article_text(page: Page, preview_text: str = ''):
 
     article_text = max(fallback_candidates, key=len, default='')
     if article_text:
-        print('详情页正文容器不可用，使用主页/页面摘要继续检查关键词')
+        logger.info('详情页正文容器不可用，使用主页/页面摘要继续检查关键词')
         return article_text
 
     try:
         title = (await page.title()).strip() or '无标题'
     except Exception:
         title = '读取失败'
-    print(f'详情页没有可用正文或摘要，跳过本帖: URL={page.url}, 标题={title!r}')
+    logger.info(f'详情页没有可用正文或摘要，跳过本帖: URL={page.url}, 标题={title!r}')
     return ''
 
-async def binance_run(accounts):
+@asynccontextmanager
+async def browser_session():
     async with async_playwright() as playwright:
-        # 关闭 AutomationControlled 特征，降低被反爬识别的概率
-        browser = await playwright.chromium.launch(
+        # 使用原生 Chromium 配置，保留独立用户目录中的站点存储和缓存。
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(BROWSER_DATA_DIR),
+            channel='chromium',
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            locale='zh-CN',
+            viewport={'width': 1280, 'height': 900},
         )
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            locale="zh-CN",
-            viewport={"width": 1280, "height": 900},
-        )
-        # 隐藏 webdriver 标志
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        logger.info('浏览器会话已启动，跨轮复用站点存储和缓存')
         try:
-            await asyncio.gather(
-                *(visit_account(context, account) for account in accounts)
-            )
+            yield context
         finally:
-            await browser.close()
+            await context.close()
 
-async def visit_account(context: BrowserContext, account: str):
+
+async def binance_run(accounts, context=None):
+    if context is None:
+        async with browser_session() as context:
+            return await binance_run(accounts, context)
+    gate = NavigationGate()
+    tasks = [asyncio.create_task(visit_account(context, account, gate)) for account in accounts]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def visit_account(context: BrowserContext, account: str, gate=None):
     async with sem:
         page = await context.new_page()
         try:
             url = f'https://www.binance.com/zh-CN/square/profile/{account}'
-            print(f'Visiting URL: {url}')
-            await goto_feed_page(page, url)
+            logger.info(f'Visiting URL: {url}')
+            await goto_feed_page(page, url, gate)
             # 币安已移除 .FeedList 包裹层，直接使用 .feed-card
             # 先在个人主页收集前 2 篇非置顶文章的链接，再逐篇进入详情页检查时间与关键词：
             # 找到第一篇「最近 N 分钟内 + 含关键词」的即推送并结束；若某篇无时间戳(--)或超过
@@ -206,7 +290,7 @@ async def visit_account(context: BrowserContext, account: str):
                     await card_locator.wait_for(state='visible', timeout=5000)
                     card_text = await card_locator.text_content() or ''
                 except Exception as e:
-                    print(f'获取第 {idx} 条卡片文本失败: {e}')
+                    logger.info(f'获取第 {idx} 条卡片文本失败: {e}')
                     idx += 1
                     continue
                 if card_text.strip() and '置顶' not in card_text:
@@ -221,43 +305,56 @@ async def visit_account(context: BrowserContext, account: str):
                 idx += 1
 
             if not candidate_articles:
-                print('未找到候选文章，跳过')
+                logger.info('未找到候选文章，跳过')
                 return
 
+            failed_articles = 0
             for i, (rel, preview_text) in enumerate(candidate_articles):
                 detail_url = f'https://www.binance.com{rel}'
-                print(f'检查候选 {i}: {detail_url}')
-                await goto_feed_page(page, detail_url)
-                # 发布时间由 JS 异步渲染，冷加载可能先返回 '--'，原地轮询等待真实值
+                logger.info(f'检查候选 {i}: {detail_url}')
+                try:
+                    await goto_feed_page(page, detail_url, gate)
+                except WafChallengeError:
+                    raise
+                except FeedPageLoadError as exc:
+                    failed_articles += 1
+                    logger.warning('详情页网络或渲染失败，继续检查下一条: %s', detail_url)
+                    notify_error(exc)
+                    continue
                 await asyncio.sleep(2)
-                create_time = await get_create_time(page)  # 14分钟 或 14 分钟前
+                create_time = await get_create_time(page)
                 mins, ext = parse_create_time(create_time)
-                print(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
+                logger.info(f'Article create time: {create_time}, parsed as【{mins}】【{ext}】')
 
                 if mins <= effective_time and ext == '分钟':
                     article_text = await get_article_text(page, preview_text)
                     if not article_text:
-                        print('未能获取文章正文，继续检查下一条')
+                        logger.info('未能获取文章正文，继续检查下一条')
                         continue
                     if not check_keywords(article_text):
-                        print('文章内容不包含关键词，继续检查下一条')
+                        logger.info('文章内容不包含关键词，继续检查下一条')
                         continue
                     if has_sends_url.get(detail_url):
-                        print('该新闻已发送过通知，继续检查下一条')
+                        logger.info('该新闻已发送过通知，继续检查下一条')
                         continue
                     has_sends_url[detail_url] = True
-                    print('准备发送钉钉通知')
+                    logger.info('准备发送钉钉通知')
                     res = send_dingtalk_markdown('binance广场消息报警: ' + account, article_text)
-                    print(res)
+                    logger.info(res)
                     break  # 本周期只推送一条，结束该账号检查
                 else:
-                    print('新闻发布时间超过有效时间或无时间戳，继续检查下一条')
+                    logger.info('新闻发布时间超过有效时间或无时间戳，继续检查下一条')
                     continue
             else:
-                print('候选文章均未命中条件，跳过')
+                if failed_articles:
+                    logger.info(f'本轮有 {failed_articles} 篇加载失败，其余候选未命中条件，下轮重试')
+                else:
+                    logger.info('候选文章均未命中条件，跳过')
+        except WafChallengeError:
+            raise
         except Exception as e:
             # 单个账号出错不应中断整个监控循环，捕获后统一告警
-            print(f'处理账号 {account} 时出错: {e}')
+            logger.error(f'处理账号 {account} 时出错: {e}')
             notify_error(e)
         finally:
             await page.close()
@@ -274,14 +371,14 @@ def _post_dingtalk(payload):
     """发送钉钉消息，返回响应；发送失败仅打印不影响主流程"""
     headers = {'Content-Type': 'application/json'}
     if not dingding_token:
-        print('未配置 dingding_token，跳过钉钉推送')
+        logger.info('未配置 dingding_token，跳过钉钉推送')
         return None
     webhook_url = f'https://oapi.dingtalk.com/robot/send?access_token={dingding_token}'
     try:
         response = requests.post(webhook_url, headers=headers, data=json.dumps(payload), timeout=10)
         return response.json()
     except Exception as e:
-        print('钉钉推送请求失败:', e)
+        logger.error('钉钉推送请求失败: %s', e)
         return None
 
 def send_dingtalk_markdown(title, text, is_at_all=True):
@@ -313,7 +410,7 @@ def notify_error(exc: Exception):
     global last_error_notify_time
     now = time.time()
     if now - last_error_notify_time < ERROR_NOTIFY_INTERVAL:
-        print('错误告警处于 10 分钟冷却期，本次跳过')
+        logger.info('错误告警处于 10 分钟冷却期，本次跳过')
         return
     last_error_notify_time = now
 
@@ -331,9 +428,9 @@ def notify_error(exc: Exception):
         "markdown": {"title": title, "text": markdown_text},
         "at": {"atMobiles": [], "isAtAll": False},
     }
-    print('推送错误告警到钉钉...')
+    logger.info('推送错误告警到钉钉...')
     res = _post_dingtalk(payload)
-    print('错误告警发送结果:', res)
+    logger.info('错误告警发送结果: %s', res)
 
 def mark_down_template(title, text):
     return f"""
@@ -346,21 +443,36 @@ def mark_down_template(title, text):
 def get_current_time():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-async def main():
-    print('Starting Binance news monitoring...')
+async def monitor_loop(context, accounts):
     while True:
         try:
             if len(has_sends_url) > 1000:
-                has_sends_url.clear()  # 清理已发送记录，防止内存占用过高
-            print('Checking Binance news...')
-            await binance_run(binance_accounts)
-        except Exception as e:
-            # 顶层兜底：浏览器启动/网络等致命错误也会触发告警
-            print(f'检测循环发生异常: {e}')
-            notify_error(e)
-        print('Waiting for 60 seconds before the next check...')
-        # 每 60 秒检查一次
+                has_sends_url.clear()
+            logger.info('开始检查 Binance 新闻')
+            await binance_run(accounts, context)
+        except WafChallengeError as exc:
+            logger.error('浏览器验证未完成，整轮监控暂停；保留会话，60 秒后重新检查: %s', exc)
+            notify_error(exc)
+        except Exception as exc:
+            logger.error('检测循环发生异常: %s', exc)
+            notify_error(exc)
+            if not context.browser or not context.browser.is_connected():
+                raise
+        logger.info('等待 60 秒后进行下一轮检查')
         await asyncio.sleep(60)
+
+
+async def main():
+    logger.info('启动 Binance 新闻监控')
+    while True:
+        try:
+            async with browser_session() as context:
+                await monitor_loop(context, binance_accounts)
+        except Exception as exc:
+            logger.error('浏览器会话异常，60 秒后重建: %s', exc)
+            notify_error(exc)
+            await asyncio.sleep(60)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
